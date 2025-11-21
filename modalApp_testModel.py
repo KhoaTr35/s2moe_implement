@@ -89,38 +89,38 @@ def run_test():
     model.eval()
     print("✅ Model loaded successfully.")
 
-    # === Inference 1 batch ===
-    # batch = next(iter(dataloader))
-    # batch = {k: v.to(model.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-    # print(f"🔍 Batch keys: {list(batch.keys())}")
+    #=== Inference 1 batch ===
+    batch = next(iter(dataloader))
+    batch = {k: v.to(model.device) if torch.is_tensor(v) else v for k, v in batch.items()}
+    print(f"🔍 Batch keys: {list(batch.keys())}")
 
-    # with torch.inference_mode():
-    #     output_ids = model.generate(**batch, max_new_tokens=64)
-    #     generated_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+    with torch.inference_mode():
+        output_ids = model.generate(**batch, max_new_tokens=64)
+        generated_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
 
-    # print("\n🧠 Inference output:")
-    # print(generated_text[:500])
+    print("\n🧠 Inference output:")
+    print(generated_text[:500])
 
-    # return generated_text
+    return generated_text
 
-    # ==== Check model parameters ====
-    print("\n=== Parameter names and shapes ===")
-    count = 0
-    for name, param in model.named_parameters():
-        print(f"{name:70s} {tuple(param.shape)}")
-        count += 1
-    print(f"\nTotal parameter tensors: {count}")
+    # # ==== Check model parameters ====
+    # print("\n=== Parameter names and shapes ===")
+    # count = 0
+    # for name, param in model.named_parameters():
+    #     print(f"{name:70s} {tuple(param.shape)}")
+    #     count += 1
+    # print(f"\nTotal parameter tensors: {count}")
 
-    # Total parameter count
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters (elements): {total_params:,}")
+    # # Total parameter count
+    # total_params = sum(p.numel() for p in model.parameters())
+    # print(f"Total parameters (elements): {total_params:,}")
 
-    for n, p in model.named_parameters():
-        p.requires_grad = False
+    # for n, p in model.named_parameters():
+    #     p.requires_grad = False
 
-    print("✅ All parameters frozen.")
+    # print("✅ All parameters frozen.")
 
-    replace_mlp(model, is_s2moe=True)
+    # replace_mlp(model, is_s2moe=True)
     
 @app.function(
     image=image,
@@ -357,11 +357,100 @@ def verify_dataset():
             traceback.print_exc()
     
     return "Dataset verification complete"
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=60 * 24 * 60,
+    volumes={"/root/llava-data": volume},
+    secrets=[modal.Secret.from_dotenv()],   # để load HF_TOKEN nếu cần
+)
+def hf_infer_test(
+    image_path="coco/train2017/000000149669.jpg",
+    prompt="Describe the image in detail."
+):
+    """
+    LOAD base model or fine-tuned model from HF Hub
+    and run inference giống như training pipeline.
+    Không dùng chat template sai.
+    Không dùng <|vision_start|> token.
+    """
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor, AutoModelForVision2Seq
+
+    model_id = "KhTran35/s2moe-qwen-finetuned1-20251121-143845"
+
+    print(f"🔍 Loading model from HF Hub: {model_id}")
+
+    # === Load processor ===
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        trust_remote_code=True
+    )
+
+    # === Load model ===
+    model = AutoModelForVision2Seq.from_pretrained(
+        model_id,
+        dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+    print("✅ Model loaded successfully.")
+
+    # === Load image ===
+    img_full_path = f"/root/llava-data/{image_path}"
+    print(f"🖼️ Loading image: {img_full_path}")
+    image = Image.open(img_full_path).convert("RGB")
+
+    # === Encode image + prompt (training-style encoding) ===
+    print("🔄 Encoding image + text using processor...")
+    inputs = processor(
+        images=image,
+        text=prompt,
+        padding=True,
+        return_tensors="pt"
+    ).to(model.device)
+
+    print(f"🎨 pixel_values shape = {inputs['pixel_values'].shape}")  
+    # Expect: [1, 3, H, W]
+
+    # === Generate ===
+    print("🧠 Running inference...")
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=128,
+            do_sample=True,
+            top_p=0.9,
+            temperature=0.7,
+        )
+
+    # === Decode ===
+    output_text = processor.batch_decode(
+        output_ids,
+        skip_special_tokens=True
+    )[0]
+
+    print("\n====================")
+    print("🧠 MODEL OUTPUT")
+    print("====================")
+    print(output_text)
+    print("====================\n")
+
+    return output_text
+
 # ----------------------------
 # Entry point
 # ----------------------------
 if __name__ == "__main__":
     with app.run():
-        verify_dataset.remote()
+        hf_infer_test.remote(
+            image_path="coco/train2017/000000149669.jpg",
+            prompt="Describe the image in detail."
+        )
+        #verify_dataset.remote()
         # run_test.remote()
         #test_forward_backward.remote()

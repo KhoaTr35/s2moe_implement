@@ -3,7 +3,7 @@ from pathlib import Path
 
 # === Khai báo app và volume mount ===
 app = modal.App("download-qwen-vl-model")
-volume = modal.Volume.from_name("llava-data", create_if_missing=False)
+volume = modal.Volume.from_name("llava-data", create_if_missing=True)
 
 # === Tạo image với dependencies ===
 image = modal.Image.debian_slim().pip_install("huggingface_hub")
