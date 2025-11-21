@@ -15,7 +15,7 @@ image = (
         "torch", "torchvision", "torchaudio",
         "transformers", "datasets", "Pillow",
         "accelerate", "bitsandbytes", "sentencepiece",
-        "safetensors", "qwen-vl-utils", "wandb"
+        "safetensors", "qwen-vl-utils", "wandb", "huggingface-hub",
     )
     # Mount all local Python files
     .add_local_file("dataloader_qwen.py", remote_path="/root/dataloader_qwen.py", copy=True)

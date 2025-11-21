@@ -19,6 +19,12 @@ import wandb
 from datetime import datetime
 import numpy as np
 from pathlib import Path
+from huggingface_hub import login
+
+try:
+    login(token=os.getenv("HF_TOKEN"))
+except:
+    print("⚠️ HuggingFace token not found, using existing CLI login...")
 
 # Import local modules
 from dataloader_qwen import QwenVLDataset
@@ -49,7 +55,7 @@ class S2MoETrainer(Trainer):
         loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        main_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         
         # Collect auxiliary losses and expert statistics
         aux_losses = {'Lb': [], 'Lu': []}
@@ -86,24 +92,31 @@ class S2MoETrainer(Trainer):
                         }, step=self.state.global_step)
         
         # Compute weighted auxiliary losses
-        total_loss = loss
+        # total_loss = loss
         lb_loss_val = 0.0
         lu_loss_val = 0.0
         
         if aux_losses['Lb']:
             lb_loss = torch.stack(aux_losses['Lb']).mean()
-            total_loss = total_loss + alpha_bal * lb_loss
+            # total_loss = total_loss + alpha_bal * lb_loss
             lb_loss_val = lb_loss.item()
+        else:
+            lb_loss = torch.tensor(0.0, device=main_loss.device, dtype=main_loss.dtype)
         
         if aux_losses['Lu']:
             lu_loss = torch.stack(aux_losses['Lu']).mean()
-            total_loss = total_loss + beta_unc * lu_loss
+            # total_loss = total_loss + beta_unc * lu_loss
             lu_loss_val = lu_loss.item()
+        else:
+            lu_loss = torch.tensor(0.0, device=main_loss.device, dtype=main_loss.dtype)
+
+        total_loss = main_loss + alpha_bal * lb_loss + beta_unc * lu_loss
         
+
         # Log metrics
         step_log = {
             "step": self.state.global_step,
-            "main_loss": loss.item(),
+            "main_loss": main_loss.item(), # fair comparison
             "lb_loss": lb_loss_val,
             "lu_loss": lu_loss_val,
             "total_loss": total_loss.item(),
@@ -119,7 +132,10 @@ class S2MoETrainer(Trainer):
         
         # Log to wandb
         wandb.log({
-            "train/main_loss": loss.item(),
+            "train/main_loss": main_loss.item(),
+            "train/perplexity": torch.exp(main_loss).item(),
+
+            #auxiliary loss (s2moe only)
             "train/lb_loss": lb_loss_val,
             "train/lu_loss": lu_loss_val,
             "train/total_loss": total_loss.item(),
@@ -160,6 +176,7 @@ class DetailedLoggingCallback(TrainerCallback):
         self.train_losses = []
         self.eval_losses = []
         self.best_eval_loss = float('inf')
+        self.best_main_loss = float('inf') # track best main loss
         
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs:
@@ -185,12 +202,19 @@ class DetailedLoggingCallback(TrainerCallback):
             self.eval_losses.append(eval_log)
             
             # Track best model
-            if metrics.get('eval_loss', float('inf')) < self.best_eval_loss:
-                self.best_eval_loss = metrics['eval_loss']
+            eval_loss = metrics.get('eval_loss', float('inf'))
+            if eval_loss < self.best_eval_loss:
+                self.best_eval_loss = eval_loss
                 print(f"\n🏆 New best eval loss: {self.best_eval_loss:.4f} at step {state.global_step}")
             
             # Log to wandb
-            wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=state.global_step)
+            # wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=state.global_step)
+            # NEW: Log eval metrics with clear naming
+            wandb.log({
+                "eval/main_loss": eval_loss,  # 👈 FAIR metric for comparison
+                "eval/perplexity": torch.exp(torch.tensor(eval_loss)).item(),
+                **{f"eval/{k}": v for k, v in metrics.items()},
+            }, step=state.global_step)
             
             # Save metrics to file
             with open(f"{self.log_dir}/eval_metrics.jsonl", "a") as f:
@@ -203,8 +227,18 @@ class DetailedLoggingCallback(TrainerCallback):
         
         with open(f"{self.log_dir}/eval_losses.json", "w") as f:
             json.dump(self.eval_losses, f, indent=2)
+
+        # NEW: save best metrics summary
+        best_metrics = {
+            "best_eval_loss": self.best_eval_loss,
+            "best_eval_perplexity": torch.exp(torch.tensor(self.best_eval_loss)).item(),
+        }
+        with open(f"{self.log_dir}/best_metrics.json", "w") as f:
+            json.dump(best_metrics, f, indent=2)
         
         print(f"\n💾 Saved training logs to {self.log_dir}")
+        print(f" !! Best eval loss: {self.best_eval_loss:.4f}")
+        print(f" !! Best eval perplexity: {torch.exp(torch.tensor(self.best_eval_loss)).item():.4f}")
 
 
 class MemoryLoggingCallback(TrainerCallback):
@@ -261,10 +295,10 @@ def train_s2moe_model(base_dir, model_path, volume=None, subset_size=None):
         "alpha_bal": 0.01,
         "beta_unc": 0.1,
         "learning_rate": 2e-4,
-        "batch_size": 1,
+        "batch_size": 2,
         "gradient_accumulation_steps": 1,
-        "num_epochs": 2,
-        "warmup_ratio": 0.1,
+        "num_epochs": 1,
+        "warmup_ratio": 0.01,
         "max_length": 1024,
         "weight_decay": 0.01,
         "timestamp": TIMESTAMP,
@@ -344,7 +378,7 @@ def train_s2moe_model(base_dir, model_path, volume=None, subset_size=None):
     print("\nReplacing MLPs with S2MoE_LoRA_MLP...")
     replace_mlp(model, is_s2moe=True)
 
-    # === Replace MLPs with MoLE ===
+    # #=== Replace MLPs with MoLE ===
     # print("\nReplacing MLPs with MoLE...")
     # replace_mlp(model, is_s2moe=False)
 
@@ -394,16 +428,16 @@ def train_s2moe_model(base_dir, model_path, volume=None, subset_size=None):
         warmup_ratio=config["warmup_ratio"],
         lr_scheduler_type="cosine",
         logging_dir=f"{LOGS_DIR}/trainer_logs",
-        logging_steps=10,
-        save_steps=50,
-        eval_steps=25,
-        save_total_limit=3,
+        logging_steps=20,
+        save_steps=200,
+        eval_steps=200,
+        save_total_limit=2,
         eval_strategy="steps",
         bf16=True,
         bf16_full_eval=True,
-        dataloader_num_workers=8,
-        dataloader_pin_memory=True,
-        dataloader_persistent_workers=True,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=False,
+        dataloader_persistent_workers=False,
         remove_unused_columns=False,
         report_to="wandb",
         run_name=f"s2moe-qwen-1k-{TIMESTAMP}",
@@ -412,6 +446,10 @@ def train_s2moe_model(base_dir, model_path, volume=None, subset_size=None):
         greater_is_better=False,
         max_grad_norm=5.0,
         save_safetensors=True,
+        push_to_hub=True,
+        hub_model_id=f"s2moe-mole-qwen-finetuned1-{TIMESTAMP}",
+        hub_strategy="end",
+
         #torch_compile=True,
         #torch_compile_backend="inductor",
         #torch_compile_mode="reduce-overhead",
@@ -453,6 +491,9 @@ def train_s2moe_model(base_dir, model_path, volume=None, subset_size=None):
         print("\nSaving final model...")
         trainer.save_model(OUTPUT_DIR)
         processor.save_pretrained(OUTPUT_DIR)
+
+        print("push to huggingface hub...")
+        trainer.push_to_hub(commit_message="Final model upload")
         
         # Save step-level logs
         with open(f"{LOGS_DIR}/step_logs.json", "w") as f:
@@ -472,12 +513,25 @@ def train_s2moe_model(base_dir, model_path, volume=None, subset_size=None):
         eval_metrics = trainer.evaluate()
         trainer.log_metrics("eval", eval_metrics)
         trainer.save_metrics("eval", eval_metrics)
+
+        # NEW: main loss for fair comparison
+        final_train_main_loss = metrics.get('train_loss', float('inf'))
+        final_eval_main_loss = eval_metrics.get('eval_loss', float('inf'))
         
         # Save training summary
         training_summary = {
             "config": config,
             "dataset_info": dataset_info,
             "model_info": model_info,
+
+            #  FAIR comparison metrics
+            "final_metrics": {
+                "train_main_loss": final_train_main_loss,
+                "train_perplexity": torch.exp(torch.tensor(final_train_main_loss)).item(),
+                "eval_main_loss": final_eval_main_loss,
+                "eval_perplexity": torch.exp(torch.tensor(final_eval_main_loss)).item(),
+            },
+
             "final_train_metrics": metrics,
             "final_eval_metrics": eval_metrics,
             "output_dir": OUTPUT_DIR,
