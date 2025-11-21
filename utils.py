@@ -1,4 +1,4 @@
-from S2MOE_LORA import LoRALayer, LoRA_MOE_LM, S2MoE_LoRA_MLP
+from S2MOE_LORA import LoRALayer, LoRA_MOE_LM, S2MoE_LoRA_MLP, MlpWithLoRAMoE, MlpWithS2MoELoRA
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,16 +15,20 @@ def replace_mlp(model, is_s2moe=False):
         print(f"Replacing {num_layers} MLPs with LoRA_MOE_LM...")
         for i in range(num_layers):
             orig_mlp = model.language_model.layers[i].mlp
-            model.language_model.layers[i].mlp = LoRA_MOE_LM(orig_mlp, num_experts=4, rank=8, alpha=32, dense_moe=False).bfloat16()
+            lora_moe_layer = LoRA_MOE_LM(orig_mlp, num_experts=4, rank=8, alpha=32, dense_moe=False)
+            # Use wrapper to ensure HuggingFace compatibility when pushing to hub
+            model.language_model.layers[i].mlp = MlpWithLoRAMoE(orig_mlp, lora_moe_layer).bfloat16()
     
         print(" MLPs replaced with LoRA_MOE_LM")
     else:
         print(f"Replacing {num_layers} MLPs with S2MoE_LoRA...")
         for i in range(num_layers):
             orig_mlp = model.language_model.layers[i].mlp
-            model.language_model.layers[i].mlp = S2MoE_LoRA_MLP(orig_mlp, num_experts=4, rank=8, alpha=32,
-                                                            lora_dropout=0.05, top_k=1,
-                                                            alpha_bal=0.01, beta_unc=0.1).bfloat16()
+            s2moe_layer = S2MoE_LoRA_MLP(orig_mlp, num_experts=4, rank=8, alpha=32,
+                                        lora_dropout=0.05, top_k=1,
+                                        alpha_bal=0.01, beta_unc=0.1)
+            # Use wrapper to ensure HuggingFace compatibility when pushing to hub
+            model.language_model.layers[i].mlp = MlpWithS2MoELoRA(orig_mlp, s2moe_layer).bfloat16()
 
         print(" MLPs replaced with S2_LoRA")
 

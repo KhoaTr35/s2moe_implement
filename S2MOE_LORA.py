@@ -37,7 +37,8 @@ class LoRA_MOE_LM(nn.Module):
         self.rank = rank
         self.alpha = alpha
         self.dense_moe = dense_moe
-        self.original_module = original_module
+        # Store original_module as a non-registered attribute to avoid circular module references
+        object.__setattr__(self, 'original_module_', original_module)
         self._aux_losses = {}
         self._last_gate_value = None
 
@@ -56,7 +57,7 @@ class LoRA_MOE_LM(nn.Module):
         self.router = nn.Linear(d_model, num_experts)
 
         # Freeze original MLP
-        for n, p in original_module.named_parameters():
+        for n, p in self.original_module_.named_parameters():
             p.requires_grad = False
 
     def forward_lora_moe(self, x, original_proj, routing, moe):
@@ -85,10 +86,10 @@ class LoRA_MOE_LM(nn.Module):
         else:
             self._aux_losses = {}
 
-        gate_out = self.forward_lora_moe(x, self.original_module.gate_proj, routing_final, self.moe_gate)
-        up_out = self.forward_lora_moe(x, self.original_module.up_proj, routing_final, self.moe_up)
-        x = self.original_module.act_fn(gate_out) * up_out
-        x = self.forward_lora_moe(x, self.original_module.down_proj, routing_final, self.moe_down)
+        gate_out = self.forward_lora_moe(x, self.original_module_.gate_proj, routing_final, self.moe_gate)
+        up_out = self.forward_lora_moe(x, self.original_module_.up_proj, routing_final, self.moe_up)
+        x = self.original_module_.act_fn(gate_out) * up_out
+        x = self.forward_lora_moe(x, self.original_module_.down_proj, routing_final, self.moe_down)
         return x
     
 class S2MoE_LoRA_MLP(nn.Module):
@@ -119,7 +120,9 @@ class S2MoE_LoRA_MLP(nn.Module):
         self.alpha_bal = alpha_bal
         self.beta_unc = beta_unc
 
-        self.original = original_module
+        # Store original_module as a non-registered attribute to avoid circular module references
+        # We use object.__setattr__ to bypass PyTorch's module registration
+        object.__setattr__(self, 'original_', original_module)
         d_model = original_module.gate_proj.in_features
         mlp_width = original_module.gate_proj.out_features
 
@@ -141,7 +144,7 @@ class S2MoE_LoRA_MLP(nn.Module):
         self.beta_noise = nn.Parameter(torch.zeros(1, 1, d_model))
 
         # Freeze original MLP parameters
-        for p in self.original.parameters():
+        for p in self.original_.parameters():
             p.requires_grad = False
 
         self._aux_losses = {}
@@ -207,10 +210,10 @@ class S2MoE_LoRA_MLP(nn.Module):
         return base + exp_mix
 
     def forward_once(self, x, routing):
-        gate = self._lora_moe_proj(x, self.original.gate_proj, routing, self.moe_gate)
-        up = self._lora_moe_proj(x, self.original.up_proj, routing, self.moe_up)
-        h = self.original.act_fn(gate) * up
-        return self._lora_moe_proj(h, self.original.down_proj, routing, self.moe_down)
+        gate = self._lora_moe_proj(x, self.original_.gate_proj, routing, self.moe_gate)
+        up = self._lora_moe_proj(x, self.original_.up_proj, routing, self.moe_up)
+        h = self.original_.act_fn(gate) * up
+        return self._lora_moe_proj(h, self.original_.down_proj, routing, self.moe_down)
 
     # ========================
     # Forward Pass
@@ -252,3 +255,41 @@ class S2MoE_LoRA_MLP(nn.Module):
 
         y = g * y_clean + (1 - g) * y_noisy
         return y
+
+
+class MlpWithLoRAMoE(nn.Module):
+    """Wrapper that replaces a layer's MLP with a LoRA-MoE-enabled module.
+
+    This avoids creating circular references by not registering the base MLP
+    as a submodule, only the LoRA-MoE layer which contains LoRA adapters and gates.
+    This ensures compatibility with HuggingFace when pushing models to the hub.
+    """
+
+    def __init__(self, base_mlp: nn.Module, lora_moe_layer: LoRA_MOE_LM) -> None:
+        super().__init__()
+        # Don't register base_mlp as a submodule to avoid circular reference
+        # It's already stored in lora_moe_layer.original_module_
+        self.lora_moe_layer = lora_moe_layer
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Delegate to the LoRA-MoE forward
+        return self.lora_moe_layer(hidden_states)
+
+
+class MlpWithS2MoELoRA(nn.Module):
+    """Wrapper that replaces a layer's MLP with a S2MoE-LoRA-enabled module.
+
+    This avoids creating circular references by not registering the base MLP
+    as a submodule, only the S2MoE-LoRA layer which contains LoRA adapters and gates.
+    This ensures compatibility with HuggingFace when pushing models to the hub.
+    """
+
+    def __init__(self, base_mlp: nn.Module, s2moe_layer: S2MoE_LoRA_MLP) -> None:
+        super().__init__()
+        # Don't register base_mlp as a submodule to avoid circular reference
+        # It's already stored in s2moe_layer.original_
+        self.s2moe_layer = s2moe_layer
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Delegate to the S2MoE-LoRA forward
+        return self.s2moe_layer(hidden_states)
