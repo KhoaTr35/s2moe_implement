@@ -42,6 +42,7 @@ model_cache/
 
 # Data (không push dataset lên GitHub)
 llava-data/
+llava-data-batches/
 
 # Checkpoints và logs
 checkpoints/
